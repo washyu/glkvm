@@ -1,0 +1,121 @@
+#!/bin/sh
+#
+# USB serial port (CDC-ACM) for the guest agent on GL RM1 firmware.
+#
+# Install as /etc/kvmd/user/scripts/S50guest-serial (run by /etc/init.d/S99custom,
+# i.e. AFTER kvmd-otg has built and bound the USB gadget), with the modules in
+# /lib/modules/$(uname -r)/extra/.
+#
+# Deliberately NOT done through otg.devices.serial in the kvmd config: if
+# kvmd-otg is told to create acm.usb0 and the kernel can't (modules missing
+# or built for another kernel after a firmware update), it aborts and the KVM
+# boots with no keyboard or mouse. Here, any failure just leaves serial off.
+#
+# Steps:
+#   1. load u_serial.ko + usb_f_acm.ko (stop if that fails)
+#   2. create the acm.usb0 function (unlinked) and register it in kvmd-otg's
+#      meta dir, so kvmd-otgconf and /api/system/otg_functions?enable_serial=1
+#      can link/unlink it like any other function
+#   3. if the port was switched on before (otg.devices.serial.start: true,
+#      saved by that toggle in /etc/kvmd/user/boot.yaml), link it again
+
+MODDIR="/lib/modules/$(uname -r)/extra"
+FUNC="acm.usb0"
+META_DIR="/run/kvmd/otg"
+BOOT_YAML="/etc/kvmd/user/boot.yaml"
+
+log() {
+	logger -t guest-serial "$*"
+	echo "guest-serial: $*"
+}
+
+gadget_dir() {
+	for dir in /sys/kernel/config/usb_gadget/*; do
+		[ -d "$dir/functions" ] && { echo "$dir"; return 0; }
+	done
+	return 1
+}
+
+# kvmd-otg builds the gadget in the background and binds it to the UDC as its
+# last step, so S99custom can get here first. Wait for the bind.
+wait_for_gadget() {
+	tries=0
+	while [ $tries -lt 90 ]; do
+		dir="$(gadget_dir)" && [ -n "$(cat "$dir/UDC" 2>/dev/null)" ] && { echo "$dir"; return 0; }
+		tries=$((tries + 1))
+		sleep 1
+	done
+	return 1
+}
+
+want_linked() {
+	[ -f "$BOOT_YAML" ] || return 1
+	python3 - "$BOOT_YAML" <<'EOF'
+import sys, yaml
+try:
+    cfg = yaml.safe_load(open(sys.argv[1])) or {}
+    start = cfg.get("otg", {}).get("devices", {}).get("serial", {}).get("start", False)
+except Exception:
+    start = False
+sys.exit(0 if start is True else 1)
+EOF
+}
+
+start() {
+	for mod in u_serial usb_f_acm; do
+		[ -d "/sys/module/$mod" ] && continue
+		if ! [ -f "$MODDIR/$mod.ko" ]; then
+			log "$MODDIR/$mod.ko not found, USB serial port unavailable"
+			return 0
+		fi
+		if ! insmod "$MODDIR/$mod.ko" 2>/tmp/guest-serial.err; then
+			log "loading $mod failed ($(cat /tmp/guest-serial.err)), USB serial port unavailable"
+			return 0
+		fi
+	done
+
+	gadget="$(wait_for_gadget)" || { log "USB gadget not bound after 90s, leaving serial off"; return 0; }
+	sleep 2  # let kvmd-otg finish writing its meta files
+	if [ ! -d "$gadget/functions/$FUNC" ]; then
+		if ! mkdir "$gadget/functions/$FUNC" 2>/tmp/guest-serial.err; then
+			log "creating $FUNC failed: $(cat /tmp/guest-serial.err)"
+			return 0
+		fi
+	fi
+
+	if [ -d "$META_DIR" ] && [ ! -f "$META_DIR/$FUNC@meta.json" ]; then
+		# Order it after every existing function, so linking it never
+		# renumbers the interfaces the host already knows.
+		order=$(cat "$META_DIR"/*@meta.json 2>/dev/null | sed -n 's/.*"order": *\([0-9]*\).*/\1/p' | sort -n | tail -1)
+		order=$(( ${order:-0} + 1 ))
+		printf '{"function": "%s", "description": "Serial Port", "endpoints": 3, "order": %d}' \
+			"$FUNC" "$order" > "$META_DIR/$FUNC@meta.json"
+	fi
+	log "$FUNC ready (port $(cat "$gadget/functions/$FUNC/port_num" 2>/dev/null), /dev/ttyGS0)"
+
+	if want_linked; then
+		if kvmd-otgconf -e "$FUNC" >/tmp/guest-serial.err 2>&1; then
+			log "$FUNC linked (otg.devices.serial.start is true)"
+		else
+			log "linking $FUNC failed: $(grep -v INFO /tmp/guest-serial.err | tail -1)"
+		fi
+	fi
+}
+
+stop() {
+	:  # kvmd-otg tears the whole gadget down on shutdown
+}
+
+case "$1" in
+	start|restart|reload)
+		start
+		;;
+	stop)
+		stop
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+exit 0

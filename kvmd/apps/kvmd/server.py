@@ -109,6 +109,7 @@ from .api.redfish import RedfishApi
 from .api.custom_screen import CustomScreenApi
 from .api.recorder import RecorderApi
 from .api.serial import SerialApi
+from .api.guest import GuestApi
 
 
 # =====
@@ -176,6 +177,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
     __EV_TURN_STATE = "turn"
     __EV_RECORDER_STATE = "recorder"
     __EV_SERIAL_STATE = "serial"
+    __EV_GUEST_STATE = "guest"
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-locals
         self,
@@ -212,6 +214,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
         self.__switch = switch
         self.__fingerbot_api = FingerbotApi()
         self.__serial_api = SerialApi()
+        self.__guest_api = GuestApi()
         self.__turn_api = TurnApi()
         self.__repeater_api = RepeaterApi()
         self.__modem_api = ModemApi()
@@ -255,6 +258,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
             ExportApi(info_manager, atx, user_gpio),
             RedfishApi(info_manager, atx),
             self.__serial_api,
+            self.__guest_api,
         ]
         if self.__switch is not None:
             self.__apis.append(SwitchApi(self.__switch))
@@ -276,6 +280,7 @@ class KvmdServer(HttpServer):  # pylint: disable=too-many-arguments,too-many-ins
             _Subsystem.make(self.__turn_api, "turn", self.__EV_TURN_STATE),
             _Subsystem.make(self.__recorder_api, "Recorder", self.__EV_RECORDER_STATE),
             _Subsystem.make(self.__serial_api, "Serial", self.__EV_SERIAL_STATE),
+            _Subsystem.make(self.__guest_api, "Guest agent", self.__EV_GUEST_STATE),
         ]
         if self.__switch is not None:
             self.__subsystems.append(_Subsystem.make(switch, "Switch", self.__EV_SWITCH_STATE))

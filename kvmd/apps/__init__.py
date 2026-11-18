@@ -720,6 +720,8 @@ def _get_config_scheme() -> dict:
                 },
 
                 "serial": {
+                    # Needed for the guest agent port. Off by default: kernels without
+                    # CONFIG_USB_CONFIGFS_ACM (e.g. RM1 firmware) fail to create acm.usb0.
                     "enabled": Option(False, type=valid_bool),
                     "start":   Option(True,  type=valid_bool),
                 },

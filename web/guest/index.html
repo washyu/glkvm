@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guest Agent</title>
+<style>
+	:root {
+		--bg: #f4f5f7; --card: #fff; --text: #1d2129; --muted: #6b7280; --line: #e5e7eb;
+		--accent: #4f6ef7; --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root {
+			--bg: #15171c; --card: #1f2229; --text: #e6e8eb; --muted: #9aa1ab; --line: #2e323b;
+			--accent: #7c93ff; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+		}
+	}
+	* { box-sizing: border-box; }
+	body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+	main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+	h1 { font-size: 20px; margin: 0 0 4px; }
+	.sub { color: var(--muted); margin: 0 0 20px; }
+	.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+	.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 12px; }
+	.row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+	.status { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+	.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+	.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+	dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+	dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
+	table { width: 100%; border-collapse: collapse; }
+	th, td { text-align: left; padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+	th { color: var(--muted); font-weight: 500; }
+	tr:last-child td { border-bottom: 0; }
+	code { font: 13px ui-monospace, Consolas, monospace; }
+	button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text); padding: 6px 14px; border-radius: 6px; cursor: pointer; }
+	button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+	button.danger { color: var(--bad); }
+	button:disabled { opacity: .5; cursor: default; }
+	.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+	.muted { color: var(--muted); }
+	.err { color: var(--bad); margin-top: 8px; }
+	.hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+	<h1>Guest Agent</h1>
+	<p class="sub">Info from <code>qemu-ga</code> running on the target host, over the KVM's USB serial port.</p>
+
+	<section class="card">
+		<div class="row">
+			<div class="status"><span id="dot" class="dot"></span><span id="status-text">Loading…</span></div>
+			<div class="actions">
+				<button id="btn-port"></button>
+				<button id="btn-refresh">Refresh</button>
+			</div>
+		</div>
+		<p id="status-detail" class="muted" style="margin:8px 0 0"></p>
+		<p id="error" class="err hidden"></p>
+	</section>
+
+	<section class="card hidden" id="card-system">
+		<h2>System</h2>
+		<dl id="system"></dl>
+	</section>
+
+	<section class="card hidden" id="card-net">
+		<h2>Network</h2>
+		<table><thead><tr><th>Interface</th><th>Addresses</th><th>MAC</th></tr></thead><tbody id="net"></tbody></table>
+	</section>
+
+	<section class="card hidden" id="card-users">
+		<h2>Logged-in users</h2>
+		<table><thead><tr><th>User</th><th>Since</th></tr></thead><tbody id="users"></tbody></table>
+	</section>
+
+	<section class="card hidden" id="card-power">
+		<h2>Power</h2>
+		<div class="actions">
+			<button class="danger" id="btn-reboot">Reboot host</button>
+			<button class="danger" id="btn-shutdown">Shut down host</button>
+		</div>
+	</section>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const INFO_COMMANDS = ["guest-get-host-name", "guest-get-osinfo", "guest-network-get-interfaces", "guest-get-users", "guest-get-timezone"];
+let portEnabled = null;
+let busy = false;
+
+function esc(text) {
+	return String(text ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"}[c]));
+}
+
+async function api(method, path) {
+	const resp = await fetch(`/api${path}`, {method, credentials: "same-origin", cache: "no-store"});
+	let body = null;
+	try { body = await resp.json(); } catch (_) { /* non-JSON error page */ }
+	if (!resp.ok || (body && body.ok === false)) {
+		const msg = body?.result?.error_msg || body?.result?.error || `HTTP ${resp.status}`;
+		throw new Error(msg);
+	}
+	return body?.result;
+}
+
+function showError(err) {
+	const el = $("error");
+	if (err) { el.textContent = String(err.message || err); el.classList.remove("hidden"); }
+	else { el.classList.add("hidden"); }
+}
+
+function ago(ts) {
+	if (!ts) return "never";
+	const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+	if (s < 60) return `${s}s ago`;
+	if (s < 3600) return `${Math.round(s / 60)}m ago`;
+	return new Date(ts * 1000).toLocaleString();
+}
+
+function isInteresting(addr) {
+	const a = addr.address;
+	return !(a === "127.0.0.1" || a === "::1" || a.startsWith("169.254.") || a.toLowerCase().startsWith("fe80:"));
+}
+
+function render(state) {
+	const dot = $("dot");
+	dot.className = "dot";
+	let text, detail = "";
+	if (!state.device) {
+		text = "Serial function not configured";
+		detail = "The KVM has no /dev/ttyGS0. Set otg.devices.serial.enabled and reboot the KVM.";
+		dot.classList.add("bad");
+	} else if (!state.port_enabled) {
+		text = "USB serial port is off";
+		detail = "Turn the port on so the host sees a COM port, then start qemu-ga on it.";
+		dot.classList.add("warn");
+	} else if (!state.connected) {
+		text = "Waiting for agent";
+		detail = state.info
+			? `Last heard from ${ago(state.last_seen)}. Showing the last known info.`
+			: "The port is on, but no agent has answered yet. Check qemu-ga is running on the host's COM port.";
+		dot.classList.add("warn");
+	} else {
+		text = "Agent connected";
+		detail = `qemu-ga ${state.agent?.version || "?"} · last reply ${ago(state.last_seen)}`;
+		const cmds = state.agent?.commands || [];
+		const blocked = INFO_COMMANDS.filter((c) => cmds.length && !cmds.includes(c));
+		if (blocked.length) {
+			detail += ` · blocked by the agent: ${blocked.join(", ")} (check its -a/--allow-rpcs list)`;
+		}
+		dot.classList.add("ok");
+	}
+	$("status-text").textContent = text;
+	$("status-detail").textContent = detail;
+
+	portEnabled = state.port_enabled;
+	const btnPort = $("btn-port");
+	btnPort.textContent = state.port_enabled ? "Turn USB port off" : "Turn USB port on";
+	btnPort.className = state.port_enabled ? "" : "primary";
+	btnPort.disabled = busy || !state.device;
+	$("btn-refresh").disabled = busy || !state.connected;
+	$("btn-reboot").disabled = busy || !state.connected;
+	$("btn-shutdown").disabled = busy || !state.connected;
+	$("card-power").classList.toggle("hidden", !state.connected);
+
+	const info = state.info;
+	for (const id of ["card-system", "card-net", "card-users"]) {
+		$(id).classList.toggle("hidden", !info);
+	}
+	if (!info) return;
+
+	const os = info.os || {};
+	const tz = info.timezone || {};
+	const rows = [
+		["Hostname", info.hostname],
+		["OS", os["pretty-name"] || os.name],
+		["Version", [os.version, os["kernel-release"] && `(kernel ${os["kernel-release"]})`].filter(Boolean).join(" ")],
+		["Architecture", os.machine],
+		["Time zone", tz.zone ? `${tz.zone} (UTC${tz.offset >= 0 ? "+" : ""}${(tz.offset / 3600).toFixed(1).replace(/\.0$/, "")})` : ""],
+		["Info updated", ago(info.updated)],
+	].filter(([, v]) => v);
+	$("system").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+
+	const ifaces = (info.interfaces || []).filter((i) => i.addresses.some(isInteresting));
+	$("net").innerHTML = ifaces.length
+		? ifaces.map((i) => `<tr><td>${esc(i.name)}</td><td>${i.addresses.filter(isInteresting)
+			.map((a) => `<code>${esc(a.address)}${a.prefix != null ? "/" + esc(a.prefix) : ""}</code>`).join("<br>")}</td>
+			<td><code>${esc(i.mac)}</code></td></tr>`).join("")
+		: `<tr><td colspan="3" class="muted">No addresses reported</td></tr>`;
+
+	const users = info.users || [];
+	$("users").innerHTML = users.length
+		? users.map((u) => `<tr><td>${esc(u.domain ? `${u.domain}\\${u.user}` : u.user)}</td>
+			<td>${u.login_time ? esc(new Date(u.login_time * 1000).toLocaleString()) : ""}</td></tr>`).join("")
+		: `<tr><td colspan="2" class="muted">Nobody logged in (or not reported)</td></tr>`;
+}
+
+async function load() {
+	try {
+		render(await api("GET", "/guest"));
+		showError(null);
+	} catch (err) {
+		showError(err);
+	}
+}
+
+async function run(fn) {
+	busy = true;
+	await load();
+	try { await fn(); showError(null); }
+	catch (err) { showError(err); }
+	finally { busy = false; await load(); }
+}
+
+$("btn-refresh").onclick = () => run(() => api("POST", "/guest/refresh"));
+$("btn-port").onclick = () => run(() => api("POST", `/system/otg_functions?enable_serial=${portEnabled ? 0 : 1}`));
+$("btn-reboot").onclick = () => {
+	if (confirm("Reboot the host? Unsaved work on it will be lost.")) run(() => api("POST", "/guest/power?action=reboot"));
+};
+$("btn-shutdown").onclick = () => {
+	if (confirm("Shut down the host?")) run(() => api("POST", "/guest/power?action=shutdown"));
+};
+
+load();
+setInterval(() => { if (!busy) load(); }, 5000);
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Out-of-tree build of the USB CDC-ACM gadget function for the GL RM1 kernel.
+# Its config has the gadget core built in but no serial function, and
+# USB_CONFIGFS_ACM is a bool (it can't be selected as a module when the core
+# is built in), so the two source files are built here as external modules.
+# build.sh copies u_serial.c, u_serial.h and f_acm.c next to this file.
+
+obj-m += u_serial.o usb_f_acm.o
+usb_f_acm-y := f_acm.o
+ccflags-y += -I$(srctree)/drivers/usb/gadget/function -I$(srctree)/drivers/usb/gadget

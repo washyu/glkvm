@@ -966,6 +966,7 @@ class SystemApi:
         "enable_mic":      ("otg/devices/audio/start",        False, "uac2.usb0"),
         "enable_camera":   ("otg/devices/camera/start",       False,  "uvc.gs6"),
         "enable_mtp":      ("otg/devices/mtp/start",          False,  "ffs.mtp"),
+        "enable_serial":   ("otg/devices/serial/start",       False,  "acm.usb0"),  # Guest agent port
     }
 
     @exposed_http("GET", "/system/otg_functions")
