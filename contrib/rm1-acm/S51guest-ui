@@ -1,0 +1,75 @@
+#!/bin/sh
+#
+# Guest agent web bits for GL RM1 firmware: the /guest/ status page and the
+# clipboard-sync script inside GL's main KVM UI.
+#
+# Install as /etc/kvmd/user/scripts/S51guest-ui (run by /etc/init.d/S99custom),
+# with the files to serve in /etc/kvmd/user/guest-ui/:
+#     index.html  kvm-clipboard.js  glkvm-agent-amd64.exe  glkvm-agent-arm64.exe
+#
+# On every boot it:
+#   1. copies those files to /usr/share/kvmd/glweb/guest/ (GL's web root),
+#      restoring them if a firmware update wiped them
+#   2. adds <script src="./guest/kvm-clipboard.js"> to GL's index.html if it
+#      isn't there. GL's UI is a prebuilt bundle; this tag is the only change.
+#
+# "S51guest-ui remove" takes the tag out again and deletes the served files.
+
+SRC="/etc/kvmd/user/guest-ui"
+WEB="/usr/share/kvmd/glweb"
+DST="$WEB/guest"
+MARK="glkvm-guest-clipboard"
+
+log() {
+	logger -t guest-ui "$*"
+	echo "guest-ui: $*"
+}
+
+install_files() {
+	[ -d "$SRC" ] || { log "no $SRC; nothing to install"; return 1; }
+	mkdir -p "$DST" && chmod 755 "$DST"
+	for f in "$SRC"/*; do
+		[ -f "$f" ] || continue
+		cmp -s "$f" "$DST/${f##*/}" && continue
+		cp "$f" "$DST/" && chmod 644 "$DST/${f##*/}" && log "installed ${f##*/}"
+	done
+}
+
+inject() {
+	index="$WEB/index.html"
+	[ -f "$index" ] || { log "no $index"; return 1; }
+	[ -f "$DST/kvm-clipboard.js" ] || return 0
+	# Bust browser caches when the script changes
+	ver=$(md5sum "$DST/kvm-clipboard.js" | cut -c1-8)
+	tag="<script id=\"$MARK\" src=\"./guest/kvm-clipboard.js?v=$ver\"></script>"
+	if grep -q "$MARK" "$index"; then
+		grep -qF "$tag" "$index" && return 0
+		sed -i "/$MARK/d" "$index"
+	fi
+	[ -f "$index.pre-guest" ] || cp "$index" "$index.pre-guest"
+	# Before </body>, on its own line so remove() can delete just that line
+	sed -i "s#</body>#$tag\n</body>#" "$index" && log "added the clipboard script to GL's UI"
+}
+
+remove() {
+	sed -i "/$MARK/d" "$WEB/index.html"
+	rm -rf "$DST"
+	log "removed"
+}
+
+case "${1:-start}" in
+	start|restart|reload)
+		install_files
+		inject
+		;;
+	remove)
+		remove
+		;;
+	stop)
+		;;
+	*)
+		echo "Usage: $0 {start|remove}"
+		exit 1
+		;;
+esac
+exit 0

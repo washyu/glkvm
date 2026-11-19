@@ -11,6 +11,10 @@ running on the target host, much like a VM host does. Over a USB serial port it 
 No custom software is needed on the host. Windows 10/11 and Linux both have the USB
 serial driver built in.
 
+On Windows you can use [`glkvm-agent`](../contrib/glkvm-agent/README.md) instead of qemu-ga.
+It speaks the same protocol, installs without admin rights, and adds **clipboard sync**
+(text, both ways). It runs only while someone is logged in. See [section 2a](#2a-or-glkvm-agent-windows-clipboard-sync).
+
 ## How it fits together
 
 ```
@@ -21,6 +25,7 @@ serial driver built in.
 - `kvmd/apps/kvmd/guest_agent.py`: the qemu-ga protocol client (sync, commands, timeouts).
 - `kvmd/apps/kvmd/api/guest.py`: a background session (ping every 5 s, info refresh every 60 s) and the HTTP API.
 - `web/guest/index.html`: a small status page at `https://<kvm>/guest/`.
+- `contrib/glkvm-agent/`: the optional Windows agent (Go).
 
 ## Requirements
 
@@ -100,6 +105,47 @@ second mass-storage drive) and try again.
 4. Open `https://<kvm>/guest/`. Within a few seconds it should show **Agent connected** and the
    host's details.
 
+## 2a. Or glkvm-agent (Windows, clipboard sync)
+
+Instead of step 2:
+
+1. If qemu-ga is installed, stop it first. Only one program can hold the COM port. In an admin
+   PowerShell: `Stop-Service qemu-ga; Set-Service qemu-ga -StartupType Disabled`.
+2. Download `glkvm-agent-amd64.exe` (or `-arm64`) from the links on `https://<kvm>/guest/`.
+   To serve them, copy `contrib/glkvm-agent/dist/*.exe` next to the page.
+3. Run `glkvm-agent-amd64.exe -install`. You don't need admin. It starts now and at every
+   login, and finds the KVM's COM port by USB ID.
+
+The Guest page then shows a **Clipboard** card:
+
+- **Host clipboard:** text copied on the host appears here within about a second while the page
+  is open. **Copy to this device** puts it on the clipboard of the machine you're browsing from.
+- **Send to host:** puts text on the host's clipboard. Paste or type it into the box and click
+  **Send to host**. **Paste from this device & send** does both in one step, once the browser
+  allows clipboard access.
+
+### In the main KVM view
+
+`web/guest/kvm-clipboard.js` adds the same sync to the main KVM UI. On GL firmware,
+`contrib/rm1-acm/S51guest-ui` adds it to GL's UI. It works like VM guest additions:
+
+- **Ctrl+V** (Cmd+V on a Mac) on the video first puts this device's clipboard on the host,
+  then sends the keystroke, so the host pastes what you copied locally. Keys pressed in the
+  meantime are held and replayed in order. In text fields of the KVM UI itself, Ctrl+V works
+  normally.
+- **Copying on the host** puts the text on this device's clipboard while the KVM tab is in
+  focus. Firefox and Safari only allow that during a click or key press, so there it happens
+  on your next one.
+- A small **📋 sync on** pill at the bottom left turns this off or on (remembered per browser).
+
+The browser's own paste event carries the clipboard text, so Chrome doesn't ask for clipboard
+permission. If that event doesn't arrive, the script asks the Clipboard API, which can prompt
+once. If it gets nothing within 1.5 s, the keystroke goes through and the host pastes its own
+clipboard.
+
+The KVM polls the host clipboard only while someone has the page open (or has read
+`/api/guest/clipboard` in the last 30 s). At other times it just pings the agent every 5 s.
+
 ## 2b. Linux hosts
 
 ```sh
@@ -121,6 +167,8 @@ name and use that path instead.
 | GET  | `/api/guest` | State: `port_enabled`, `device`, `connected`, `last_seen`, `agent`, `info` |
 | POST | `/api/guest/refresh` | Re-read host info now (503 if not connected) |
 | POST | `/api/guest/power?action=shutdown\|reboot` | Ask the host to shut down / reboot |
+| GET  | `/api/guest/clipboard` | Host clipboard: `supported`, `seq`, `text` (null if not text), `truncated`, `updated`, `error`. Also keeps fast polling on for 30 s |
+| POST | `/api/guest/clipboard` | Body `{"text": "..."}` (max 256 KiB): set the host clipboard. 503 without glkvm-agent |
 
 State changes are also pushed on the kvmd websocket as `guest` events.
 Info from the last session stays in `info` after the agent disconnects, so you can still see

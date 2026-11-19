@@ -10,6 +10,7 @@ kernel or the firmware.
 | `build.sh` | Builds `u_serial.ko` and `usb_f_acm.ko` from GL's published kernel and toolchain |
 | `Kbuild` | Out-of-tree module build file used by `build.sh` |
 | `S50guest-serial` | Post-boot script: loads the modules and adds `acm.usb0` to the gadget |
+| `S51guest-ui` | Post-boot script: serves the Guest page and agent downloads, and adds clipboard sync to GL's main UI |
 
 ## Why it's safe to load
 
@@ -51,6 +52,24 @@ script re-links the port on every boot.
 **Endpoints:** the port uses 3 of the RM1's 9. With the default functions (keyboard,
 absolute mouse, relative mouse, CD-ROM, flash drive = 7) you must turn one off first,
 for example the relative mouse (1) or the flash drive (2).
+
+## Web UI (Guest page, clipboard in GL's UI)
+
+GL's main UI is a prebuilt bundle, so clipboard sync is added with one `<script>` tag in
+`/usr/share/kvmd/glweb/index.html` that loads `web/guest/kvm-clipboard.js`. `S51guest-ui`
+keeps the files in `/etc/kvmd/user/guest-ui/` and on every boot copies them to
+`glweb/guest/` and re-adds the tag if it's missing (for example after a firmware update).
+The original page is saved as `index.html.pre-guest` the first time.
+
+```sh
+ssh root@<kvm> 'mkdir -p /etc/kvmd/user/guest-ui'
+scp ../../web/guest/index.html ../../web/guest/kvm-clipboard.js \
+    ../glkvm-agent/dist/glkvm-agent-*.exe root@<kvm>:/etc/kvmd/user/guest-ui/
+scp S51guest-ui root@<kvm>:/etc/kvmd/user/scripts/
+ssh root@<kvm> 'chmod +x /etc/kvmd/user/scripts/S51guest-ui && /etc/kvmd/user/scripts/S51guest-ui start'
+```
+
+To take it out: `/etc/kvmd/user/scripts/S51guest-ui remove`, then delete the script.
 
 ## Undo
 

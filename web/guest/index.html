@@ -41,12 +41,18 @@
 	.muted { color: var(--muted); }
 	.err { color: var(--bad); margin-top: 8px; }
 	.hidden { display: none; }
+	textarea { width: 100%; min-height: 96px; resize: vertical; font: 13px/1.4 ui-monospace, Consolas, monospace;
+		background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+	.clip-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 12px 0 6px; }
+	.clip-head:first-child { margin-top: 0; }
+	.ok-text { color: var(--ok); align-self: center; }
+	a { color: var(--accent); }
 </style>
 </head>
 <body>
 <main>
 	<h1>Guest Agent</h1>
-	<p class="sub">Info from <code>qemu-ga</code> running on the target host, over the KVM's USB serial port.</p>
+	<p class="sub">Info from the guest agent (<code>glkvm-agent</code> or <code>qemu-ga</code>) running on the target host, over the KVM's USB serial port.</p>
 
 	<section class="card">
 		<div class="row">
@@ -58,6 +64,32 @@
 		</div>
 		<p id="status-detail" class="muted" style="margin:8px 0 0"></p>
 		<p id="error" class="err hidden"></p>
+	</section>
+
+	<section class="card" id="card-clip">
+		<h2>Clipboard</h2>
+		<div id="clip-ui">
+			<div class="clip-head"><strong>Host clipboard</strong><span id="clip-meta" class="muted"></span></div>
+			<textarea id="clip-host" readonly placeholder="(no text on the host clipboard)"></textarea>
+			<div class="actions" style="margin-top:8px">
+				<button id="btn-clip-copy">Copy to this device</button>
+				<span id="clip-copied" class="ok-text hidden">Copied</span>
+			</div>
+			<div class="clip-head"><strong>Send to host</strong><span class="muted">sets the host clipboard</span></div>
+			<textarea id="clip-send" placeholder="Paste or type text here"></textarea>
+			<div class="actions" style="margin-top:8px">
+				<button class="primary" id="btn-clip-send">Send to host</button>
+				<button id="btn-clip-paste">Paste from this device &amp; send</button>
+				<span id="clip-sent" class="ok-text hidden">Sent</span>
+			</div>
+		</div>
+		<p id="clip-unsupported" class="muted hidden" style="margin:0">
+			Clipboard sync needs <code>glkvm-agent</code> on the host instead of <code>qemu-ga</code>.
+			Download it for <a href="glkvm-agent-amd64.exe" download>Windows x64</a> or
+			<a href="glkvm-agent-arm64.exe" download>Windows ARM64</a>, stop the qemu-ga service, and run
+			<code>glkvm-agent-amd64.exe -install</code>.
+		</p>
+		<p id="clip-error" class="err hidden"></p>
 	</section>
 
 	<section class="card hidden" id="card-system">
@@ -91,13 +123,20 @@ const $ = (id) => document.getElementById(id);
 const INFO_COMMANDS = ["guest-get-host-name", "guest-get-osinfo", "guest-network-get-interfaces", "guest-get-users", "guest-get-timezone"];
 let portEnabled = null;
 let busy = false;
+let clipSupported = false;
+let clipSeq;  // undefined until the first read, so a null seq still renders
 
 function esc(text) {
 	return String(text ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"}[c]));
 }
 
-async function api(method, path) {
-	const resp = await fetch(`/api${path}`, {method, credentials: "same-origin", cache: "no-store"});
+async function api(method, path, json) {
+	const opts = {method, credentials: "same-origin", cache: "no-store"};
+	if (json !== undefined) {
+		opts.headers = {"Content-Type": "application/json"};
+		opts.body = JSON.stringify(json);
+	}
+	const resp = await fetch(`/api${path}`, opts);
 	let body = null;
 	try { body = await resp.json(); } catch (_) { /* non-JSON error page */ }
 	if (!resp.ok || (body && body.ok === false)) {
@@ -136,17 +175,18 @@ function render(state) {
 		dot.classList.add("bad");
 	} else if (!state.port_enabled) {
 		text = "USB serial port is off";
-		detail = "Turn the port on so the host sees a COM port, then start qemu-ga on it.";
+		detail = "Turn the port on so the host sees a COM port, then start the agent on it.";
 		dot.classList.add("warn");
 	} else if (!state.connected) {
 		text = "Waiting for agent";
 		detail = state.info
 			? `Last heard from ${ago(state.last_seen)}. Showing the last known info.`
-			: "The port is on, but no agent has answered yet. Check qemu-ga is running on the host's COM port.";
+			: "The port is on, but no agent has answered yet. Check glkvm-agent (or qemu-ga) is running on the host.";
 		dot.classList.add("warn");
 	} else {
 		text = "Agent connected";
-		detail = `qemu-ga ${state.agent?.version || "?"} · last reply ${ago(state.last_seen)}`;
+		const ver = state.agent?.version || "?";
+		detail = `${ver.startsWith("glkvm-agent") ? ver : "qemu-ga " + ver} · last reply ${ago(state.last_seen)}`;
 		const cmds = state.agent?.commands || [];
 		const blocked = INFO_COMMANDS.filter((c) => cmds.length && !cmds.includes(c));
 		if (blocked.length) {
@@ -166,6 +206,13 @@ function render(state) {
 	$("btn-reboot").disabled = busy || !state.connected;
 	$("btn-shutdown").disabled = busy || !state.connected;
 	$("card-power").classList.toggle("hidden", !state.connected);
+
+	clipSupported = Boolean(state.clipboard?.supported);
+	// Always show the card: without glkvm-agent it carries the download links
+	$("clip-ui").classList.toggle("hidden", !clipSupported);
+	$("clip-unsupported").classList.toggle("hidden", clipSupported);
+	$("btn-clip-send").disabled = !state.connected || !clipSupported;
+	$("btn-clip-paste").disabled = !state.connected || !clipSupported || !navigator.clipboard?.readText;
 
 	const info = state.info;
 	for (const id of ["card-system", "card-net", "card-users"]) {
@@ -216,17 +263,93 @@ async function run(fn) {
 	finally { busy = false; await load(); }
 }
 
+// ===== Clipboard
+
+function flash(id) {
+	const el = $(id);
+	el.classList.remove("hidden");
+	clearTimeout(el._timer);
+	el._timer = setTimeout(() => el.classList.add("hidden"), 1500);
+}
+
+function showClipError(err) {
+	const el = $("clip-error");
+	el.textContent = err ? String(err.message || err) : "";
+	el.classList.toggle("hidden", !err);
+}
+
+async function loadClipboard() {
+	if (!clipSupported || document.hidden) return;
+	try {
+		const clip = await api("GET", "/guest/clipboard");
+		if (clip.seq !== clipSeq) {
+			clipSeq = clip.seq;
+			const box = $("clip-host");
+			box.value = clip.text ?? "";
+			box.placeholder = (clip.text == null && clip.updated)
+				? "(the host clipboard has no text: maybe an image or files)"
+				: "(no text on the host clipboard)";
+		}
+		const parts = [];
+		if (clip.text != null) parts.push(`${clip.text.length} chars`);
+		if (clip.truncated) parts.push("truncated to 256 KiB");
+		if (clip.updated) parts.push(`changed ${ago(clip.updated)}`);
+		if (!clip.connected) parts.push("agent offline");
+		$("clip-meta").textContent = parts.join(" · ");
+		showClipError(clip.error ? `Host clipboard: ${clip.error}` : null);
+	} catch (err) {
+		showClipError(err);
+	}
+}
+
+async function copyLocal(text) {
+	if (navigator.clipboard?.writeText) {
+		try { await navigator.clipboard.writeText(text); return; } catch (_) { /* fall back below */ }
+	}
+	const box = $("clip-host");
+	box.focus();
+	box.select();
+	if (!document.execCommand("copy")) throw new Error("The browser blocked clipboard access; select the text and copy it by hand");
+}
+
+async function sendClipboard(text) {
+	await api("POST", "/guest/clipboard", {text});
+	flash("clip-sent");
+	await loadClipboard();
+}
+
+$("btn-clip-copy").onclick = async () => {
+	try { await copyLocal($("clip-host").value); flash("clip-copied"); showClipError(null); }
+	catch (err) { showClipError(err); }
+};
+$("btn-clip-send").onclick = async () => {
+	try { await sendClipboard($("clip-send").value); showClipError(null); }
+	catch (err) { showClipError(err); }
+};
+$("btn-clip-paste").onclick = async () => {
+	try {
+		const text = await navigator.clipboard.readText();
+		$("clip-send").value = text;
+		await sendClipboard(text);
+		showClipError(null);
+	} catch (err) {
+		showClipError(err);
+	}
+};
+
 $("btn-refresh").onclick = () => run(() => api("POST", "/guest/refresh"));
 $("btn-port").onclick = () => run(() => api("POST", `/system/otg_functions?enable_serial=${portEnabled ? 0 : 1}`));
 $("btn-reboot").onclick = () => {
-	if (confirm("Reboot the host? Unsaved work on it will be lost.")) run(() => api("POST", "/guest/power?action=reboot"));
+	if (confirm("Reboot the host? Unsaved work on it may be lost.")) run(() => api("POST", "/guest/power?action=reboot"));
 };
 $("btn-shutdown").onclick = () => {
 	if (confirm("Shut down the host?")) run(() => api("POST", "/guest/power?action=shutdown"));
 };
 
-load();
+load().then(loadClipboard);
 setInterval(() => { if (!busy) load(); }, 5000);
+setInterval(loadClipboard, 1500);
+document.addEventListener("visibilitychange", loadClipboard);
 </script>
 </body>
 </html>

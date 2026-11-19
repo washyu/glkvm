@@ -21,13 +21,19 @@
 
 
 """
-Guest agent API: talks to qemu-ga running on the target host over the USB
-serial gadget, and exposes host info (hostname, OS, IPs, users) plus clean
-shutdown/reboot.
+Guest agent API: talks to qemu-ga (or glkvm-agent, which speaks the same
+protocol) running on the target host over the USB serial gadget, and exposes
+host info (hostname, OS, IPs, users), clean shutdown/reboot and, with
+glkvm-agent, clipboard sync.
 
   GET  /api/guest                         -- current state (cached)
   POST /api/guest/refresh                 -- re-read host info now
   POST /api/guest/power?action=shutdown   -- or action=reboot
+  GET  /api/guest/clipboard               -- host clipboard text (cached)
+  POST /api/guest/clipboard  {"text": ..} -- set the host clipboard
+
+While someone reads /api/guest/clipboard, the host clipboard is polled every
+second; otherwise the agent is just pinged every few seconds.
 
 The USB serial port itself is switched on/off through the existing
 /api/system/otg_functions?enable_serial=1 toggle.
@@ -53,6 +59,7 @@ from ....validators import check_string_in_list
 from ....htserver import exposed_http
 from ....htserver import make_json_response
 from ....htserver import UnavailableError
+from ....htserver import BadRequestError
 from ....htserver import BadGatewayError
 
 from ..guest_agent import QgaChannel
@@ -74,6 +81,12 @@ _INFO_COMMANDS = (
     "guest-get-users",
     "guest-get-timezone",
 )
+
+# glkvm-agent extensions (see contrib/glkvm-agent)
+_CLIP_GET = "glkvm-clipboard-get"
+_CLIP_SET = "glkvm-clipboard-set"
+_CLIP_MAX_BYTES = 256 * 1024  # Same limit as the agent
+_CLIP_WATCH_TIME = 30.0  # Keep polling fast this long after the last clipboard read
 
 _POWER_MODES = {
     "shutdown": "powerdown",
@@ -135,12 +148,14 @@ class GuestApi:
         ping_interval: float=5.0,
         info_interval: float=60.0,
         command_timeout: float=5.0,
+        clipboard_interval: float=1.0,
     ) -> None:
 
         self.__device_path = device_path
         self.__ping_interval = ping_interval
         self.__info_interval = info_interval
         self.__command_timeout = command_timeout
+        self.__clipboard_interval = clipboard_interval
 
         self.__channel = QgaChannel(device_path)
         self.__notifier = aiotools.AioNotifier()
@@ -153,6 +168,13 @@ class GuestApi:
         self.__info: (dict | None) = None
         self.__error: (str | None) = None
 
+        self.__clip_seq: (int | None) = None
+        self.__clip_text: (str | None) = None
+        self.__clip_truncated = False
+        self.__clip_updated: (float | None) = None
+        self.__clip_error: (str | None) = None
+        self.__clip_watch_until = 0.0
+
     # ===== State
 
     async def get_state(self) -> dict:
@@ -164,6 +186,13 @@ class GuestApi:
             "error": self.__error,
             "agent": copy.deepcopy(self.__agent),
             "info": copy.deepcopy(self.__info),
+            "clipboard": {
+                "supported": self.__clip_supported(),
+                "seq": self.__clip_seq,
+                "updated": self.__clip_updated,
+                "length": (len(self.__clip_text) if self.__clip_text is not None else None),
+                "error": self.__clip_error,
+            },
         }
 
     async def trigger_state(self) -> None:
@@ -212,7 +241,10 @@ class GuestApi:
                     self.__set_connected(True, None)
                     await self.__refresh_info()
                 else:
-                    await self.__channel.execute("guest-ping", timeout=self.__command_timeout)
+                    if self.__clip_watched():
+                        await self.__poll_clipboard()  # Doubles as the ping
+                    else:
+                        await self.__channel.execute("guest-ping", timeout=self.__command_timeout)
                     self.__last_seen = time.time()
                     if time.time() - self.__last_info_ts >= self.__info_interval:
                         await self.__refresh_info()
@@ -222,7 +254,7 @@ class GuestApi:
                 if self.__connected:
                     logger.info("Guest agent: lost contact (%s)", ex)
                 self.__set_connected(False, None)
-            await self.__sleep(self.__ping_interval)
+            await self.__sleep(self.__clipboard_interval if self.__clip_watched() else self.__ping_interval)
 
     async def __sleep(self, delay: float) -> None:
         try:
@@ -281,6 +313,41 @@ class GuestApi:
         self.__agent = agent
         self.__info = info
 
+    # ===== Clipboard
+
+    def __clip_supported(self) -> bool:
+        return bool(self.__agent and _CLIP_GET in self.__agent["commands"])
+
+    def __clip_watched(self) -> bool:
+        return (self.__connected and self.__clip_supported() and time.time() < self.__clip_watch_until)
+
+    async def __poll_clipboard(self) -> None:
+        args = ({"since": self.__clip_seq} if self.__clip_seq is not None else None)
+        try:
+            result = await self.__channel.execute(_CLIP_GET, args, timeout=self.__command_timeout)
+        except QgaCommandError as ex:
+            # e.g. another app holds the clipboard; the agent itself is fine
+            self.__set_clip_error(str(ex))
+            return
+        if not isinstance(result, dict) or not isinstance(result.get("seq"), int):
+            self.__set_clip_error("Malformed clipboard reply")
+            return
+        self.__set_clip_error(None)
+        if result.get("changed"):
+            text = result.get("text")
+            self.__clip_text = (text if isinstance(text, str) else None)
+            self.__clip_truncated = bool(result.get("truncated"))
+            self.__clip_updated = time.time()
+            self.__notifier.notify()
+        self.__clip_seq = result["seq"]
+
+    def __set_clip_error(self, error: (str | None)) -> None:
+        if error != self.__clip_error:
+            if error:
+                get_logger(0).warning("Guest agent: clipboard: %s", error)
+            self.__clip_error = error
+            self.__notifier.notify()
+
     # ===== HTTP
 
     @exposed_http("GET", "/guest")
@@ -318,3 +385,48 @@ class GuestApi:
     def __ensure_connected(self) -> None:
         if not self.__connected or not self.__channel.is_open():
             raise UnavailableError("Guest agent is not connected")
+
+    @exposed_http("GET", "/guest/clipboard")
+    async def __clipboard_get_handler(self, _: Request) -> Response:
+        was_watched = self.__clip_watched()
+        self.__clip_watch_until = time.time() + _CLIP_WATCH_TIME
+        if not was_watched and self.__clip_watched():
+            self.__wakeup.set()  # Start fast polling now, not after the current ping sleep
+        return make_json_response({
+            "supported": self.__clip_supported(),
+            "connected": self.__connected,
+            "seq": self.__clip_seq,
+            "text": self.__clip_text,
+            "truncated": self.__clip_truncated,
+            "updated": self.__clip_updated,
+            "error": self.__clip_error,
+        })
+
+    @exposed_http("POST", "/guest/clipboard")
+    async def __clipboard_set_handler(self, req: Request) -> Response:
+        try:
+            body = await req.json()
+        except Exception:
+            raise BadRequestError("Expected a JSON body like {\"text\": \"...\"}")
+        text = (body.get("text") if isinstance(body, dict) else None)
+        if not isinstance(text, str):
+            raise BadRequestError("Missing 'text'")
+        if len(text.encode("utf-8", errors="replace")) > _CLIP_MAX_BYTES:
+            raise BadRequestError(f"Text is too long (limit {_CLIP_MAX_BYTES // 1024} KiB)")
+        if "\0" in text:
+            raise BadRequestError("Text can't contain NUL characters")
+        self.__ensure_connected()
+        if not self.__clip_supported():
+            raise UnavailableError("The guest agent has no clipboard support (needs glkvm-agent)")
+        try:
+            result = await self.__channel.execute(_CLIP_SET, {"text": text}, timeout=self.__command_timeout)
+        except QgaError as ex:
+            raise BadGatewayError(f"Guest agent error: {ex}")
+        # Remember what we set, so the next poll doesn't report it as a host change
+        if isinstance(result, dict) and isinstance(result.get("seq"), int):
+            self.__clip_seq = result["seq"]
+        self.__clip_text = text.replace("\r\n", "\n")
+        self.__clip_truncated = False
+        self.__clip_updated = time.time()
+        self.__notifier.notify()
+        return make_json_response({"seq": self.__clip_seq})
